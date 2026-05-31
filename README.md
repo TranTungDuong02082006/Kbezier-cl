@@ -88,9 +88,9 @@ Tests verify mathematical correctness:
 ## Citation
 
 ```bibtex
-@article{kbezier2025,
+@article{kbezier2026,
   title={Unifying Information Geometry and Mode Connectivity:
          A Kronecker-Factored Riemannian Approach to Long-Sequence Continual Learning},
-  year={2025}
+  year={2026}
 }
 ```

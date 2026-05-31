@@ -1,0 +1,7 @@
+# EWC — Elastic Weight Consolidation baseline
+method:
+  name: "ewc"
+  ewc_lambda: 400.0        # regularization strength
+  fisher_type: "diagonal"   # diagonal Fisher for EWC
+  online: true              # online EWC (running average of Fisher)
+  decay: 0.999              # Fisher decay factor for online EWC

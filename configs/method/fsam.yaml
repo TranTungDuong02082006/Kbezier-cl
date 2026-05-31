@@ -1,0 +1,8 @@
+# F-SAM — Fisher SAM (Kwon et al., 2021) baseline
+# Closest competitor: also uses Fisher to shape SAM neighborhood
+# Key difference from R-SAM: diagonal Fisher only, current task only, no mixture
+method:
+  name: "fsam"
+  rho: 0.05
+  fisher_type: "diagonal"   # F-SAM uses diagonal Fisher (not Kronecker)
+  # No mixture (γ not applicable) — only current-task Fisher

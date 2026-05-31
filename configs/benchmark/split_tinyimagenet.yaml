@@ -1,0 +1,18 @@
+# Split TinyImageNet — harder benchmark (20 tasks × 10 classes)
+benchmark:
+  name: "split_tinyimagenet"
+  dataset: "TinyImageNet"
+  n_tasks: 20
+  classes_per_task: 10
+  scenario: "class-IL"
+  input_size: [3, 64, 64]
+  n_classes: 200
+  data_dir: "./data/tiny-imagenet-200"
+
+model:
+  name: "reduced_resnet18"
+  nf: 20
+
+epochs_per_task: 100
+batch_size: 32
+lr: 0.03

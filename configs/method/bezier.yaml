@@ -1,0 +1,11 @@
+# Bézier — connectivity only (no R-SAM), standard SGD optimizer
+# For ablation: isolates contribution of Bézier path connectivity
+method:
+  name: "bezier"
+  connectivity:
+    type: "bezier"            # "bezier" or "linear"
+    kappa: 0.1                # κ: weight of Fisher-geodesic regularizer
+    n_theta_samples: 2        # stochastic θ samples per step
+    control_point_lr: 0.01    # learning rate for w_v
+  replay:
+    buffer_size: 200          # samples per task for path-loss

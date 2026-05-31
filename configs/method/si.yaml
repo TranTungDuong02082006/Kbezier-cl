@@ -1,0 +1,5 @@
+# SI — Synaptic Intelligence baseline
+method:
+  name: "si"
+  si_lambda: 1.0           # regularization strength
+  si_epsilon: 0.1          # damping for importance (avoid division by zero)

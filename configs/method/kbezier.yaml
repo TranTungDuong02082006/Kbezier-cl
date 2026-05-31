@@ -1,0 +1,26 @@
+# K-Bézier — Full method: R-SAM + Bézier Path Connectivity
+method:
+  name: "kbezier"
+
+  # R-SAM optimizer (local flatness)
+  rho: 0.05                   # perturbation radius (Riemannian ellipsoid)
+  fisher_type: "kfac"
+  gamma: 0.75                  # mixture: F = γ F_old + (1-γ) F_t + λI
+  fisher:
+    damping: 1.0e-3
+    update_freq: 1
+    samples: 1000
+
+  # Bézier connectivity (global structure)
+  connectivity:
+    type: "bezier"
+    kappa: 0.1                 # κ: Fisher-geodesic regularizer weight
+    alpha: 1.0                 # α: path-loss weight in total loss
+    n_theta_samples: 2         # stochastic θ samples per step
+    control_point_lr: 0.01
+    control_point_init: "midpoint"  # "midpoint" or "random"
+
+  # Replay buffer for path-loss
+  replay:
+    buffer_size: 200           # samples per task
+    strategy: "reservoir"      # reservoir sampling

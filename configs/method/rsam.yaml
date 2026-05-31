@@ -1,0 +1,11 @@
+# R-SAM — K-FAC Riemannian SAM (ours, optimizer only, no connectivity)
+# For ablation: isolates contribution of Riemannian perturbation
+method:
+  name: "rsam"
+  rho: 0.05                 # perturbation radius (Riemannian ellipsoid)
+  fisher_type: "kfac"        # K-FAC Fisher (Kronecker-factored)
+  gamma: 0.75                # mixture: F = γ F_old + (1-γ) F_t + λI
+  fisher:
+    damping: 1.0e-3
+    update_freq: 1
+    samples: 1000

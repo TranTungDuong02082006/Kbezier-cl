@@ -1,0 +1,18 @@
+# Sequential CIFAR-100 — long-sequence benchmark (50 tasks × 2 classes)
+# This is the setting designed to demonstrate K-Bézier's advantage on long sequences.
+benchmark:
+  name: "seq_cifar100_50t"
+  dataset: "CIFAR100"
+  n_tasks: 50
+  classes_per_task: 2
+  scenario: "class-IL"
+  input_size: [3, 32, 32]
+  n_classes: 100
+
+model:
+  name: "reduced_resnet18"
+  nf: 20
+
+epochs_per_task: 30
+batch_size: 64
+lr: 0.03

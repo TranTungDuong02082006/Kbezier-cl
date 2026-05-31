@@ -1,0 +1,4 @@
+# Finetune — no regularization baseline
+method:
+  name: "finetune"
+  # No additional parameters — pure SGD on each task sequentially

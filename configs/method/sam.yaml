@@ -1,0 +1,5 @@
+# SAM — Sharpness-Aware Minimization (Euclidean) baseline
+method:
+  name: "sam"
+  rho: 0.05                # perturbation radius (Euclidean ball)
+  adaptive: false           # use adaptive SAM variant

@@ -1,0 +1,7 @@
+# Fisher update frequency sweep — compute vs accuracy tradeoff
+# Higher freq = more accurate Fisher but slower training
+ablation:
+  sweep_param: "method.fisher.update_freq"
+  values: [1, 2, 5, 10]
+  base_method: "kbezier"
+  seeds: [1, 2, 3, 4, 5]

@@ -1,0 +1,7 @@
+# ρ sweep — perturbation radius for R-SAM
+# ρ² / λ controls the forgetting bound (Proposition 2)
+ablation:
+  sweep_param: "method.rho"
+  values: [0.01, 0.02, 0.05, 0.1, 0.2]
+  base_method: "kbezier"
+  seeds: [1, 2, 3, 4, 5]

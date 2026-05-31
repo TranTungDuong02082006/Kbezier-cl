@@ -1,0 +1,17 @@
+# Split CIFAR-100 — main benchmark (20 tasks × 5 classes)
+benchmark:
+  name: "split_cifar100"
+  dataset: "CIFAR100"
+  n_tasks: 20
+  classes_per_task: 5
+  scenario: "class-IL"     # single expanding head, no task-id at test
+  input_size: [3, 32, 32]
+  n_classes: 100
+
+model:
+  name: "reduced_resnet18"
+  nf: 20                    # number of base filters
+
+epochs_per_task: 50
+batch_size: 64
+lr: 0.03

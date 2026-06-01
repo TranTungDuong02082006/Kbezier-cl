@@ -33,7 +33,7 @@ class MLP(nn.Module):
         prev_size = input_size
         for h in hidden_sizes:
             layers.append(nn.Linear(prev_size, h))
-            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.ReLU(inplace=False))
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             prev_size = h

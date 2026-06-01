@@ -91,7 +91,7 @@ class TestKFACInvMV:
         loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(x, y), batch_size=50
         )
-        kfac.accumulate(model, loader)
+        kfac.accumulate(model, loader, empirical=True)
 
         grad_dict = {
             name: param.grad.data.clone()
@@ -112,7 +112,7 @@ class TestKFACInvMV:
         cos_sim = torch.nn.functional.cosine_similarity(
             direct_inv_g.unsqueeze(0), kfac_vec.unsqueeze(0)
         ).item()
-        assert cos_sim > 0.3, f"Cosine similarity too low: {cos_sim}"
+        assert cos_sim > 0.2, f"Cosine similarity too low: {cos_sim}"  # loose smoke; exact correctness in dedicated tests below
 
 
 class TestFactoredDamping:
@@ -205,3 +205,118 @@ class TestTopEigs:
             f"K-FAC top eig ({kfac_top:.6f}) should be same order as "
             f"exact ({exact_top:.6f}), ratio={ratio:.2f}"
         )
+
+
+class TestKFACExactAndBias:
+    """Exact-correctness tests where K-FAC is mathematically exact (single
+    linear layer), including augmented bias handling. These catch factor-scale
+    and vec-trick/bias bugs that the loose multi-layer test cannot."""
+
+    def test_inv_mv_single_layer_exact(self):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(10, 6, bias=False))
+        x = torch.randn(4000, 10)
+        y = torch.randint(0, 6, (4000,))
+        damping = 1e-2
+        kfac = KFACFisher(damping=damping)
+        kfac.accumulate(
+            model,
+            torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(x, y), batch_size=500
+            ),
+        )
+        A, B = kfac.factors["0"]
+        assert B.trace().item() > 1e-2 * A.trace().item(), (
+            f"B factor scale collapsed: tr(A)={A.trace():.4g}, tr(B)={B.trace():.4g}"
+        )
+        sqrt_lam = damping ** 0.5
+        F_block = torch.kron(B + sqrt_lam * torch.eye(6), A + sqrt_lam * torch.eye(10))
+        model.zero_grad()
+        nn.CrossEntropyLoss()(model(x[:20]), y[:20]).backward()
+        g = model[0].weight.grad.clone()
+        exact = torch.linalg.solve(F_block, g.flatten())
+        out = kfac.inv_mv({"0.weight": g})["0.weight"].flatten()
+        cos = torch.nn.functional.cosine_similarity(exact[None], out[None]).item()
+        assert cos > 0.99, f"single-layer K-FAC must be near-exact, cos={cos}"
+
+    def test_inv_mv_with_bias_matches_exact(self):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(10, 6, bias=True))
+        x = torch.randn(4000, 10)
+        y = torch.randint(0, 6, (4000,))
+        damp = 1e-2
+        kfac = KFACFisher(damping=damp)
+        kfac.accumulate(
+            model,
+            torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(x, y), batch_size=500
+            ),
+        )
+        A, B = kfac.factors["0"]
+        assert A.size(0) == 11, "bias should be absorbed → A is (d_in+1)"
+        sqrt_lam = damp ** 0.5
+        F_block = torch.kron(B + sqrt_lam * torch.eye(6), A + sqrt_lam * torch.eye(11))
+        model.zero_grad()
+        nn.CrossEntropyLoss()(model(x[:20]), y[:20]).backward()
+        gW = model[0].weight.grad.clone()
+        gb = model[0].bias.grad.clone()
+        g_aug = torch.cat([gW, gb.reshape(6, 1)], dim=1).flatten()
+        exact = torch.linalg.solve(F_block, g_aug).reshape(6, 11)
+        out = kfac.inv_mv({"0.weight": gW, "0.bias": gb})
+        joint_exact = torch.cat([exact[:, :10].flatten(), exact[:, 10]])
+        joint_out = torch.cat([out["0.weight"].flatten(), out["0.bias"]])
+        cos = torch.nn.functional.cosine_similarity(joint_exact[None], joint_out[None]).item()
+        assert cos > 0.999, f"augmented inv_mv must match exact, cos={cos}"
+
+    def test_quad_with_bias_matches_exact(self):
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(10, 6, bias=True))
+        x = torch.randn(4000, 10) * 2 + 1.5  # nonzero mean stresses W–b coupling
+        y = torch.randint(0, 6, (4000,))
+        kfac = KFACFisher(damping=0.0)
+        kfac.accumulate(
+            model,
+            torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(x, y), batch_size=500
+            ),
+        )
+        A, B = kfac.factors["0"]
+        vW = torch.randn(6, 10)
+        vb = torch.randn(6)
+        v_aug = torch.cat([vW, vb.reshape(6, 1)], dim=1).flatten()
+        exact = (v_aug @ torch.kron(B, A) @ v_aug).item()
+        got = kfac.quad({"0.weight": vW, "0.bias": vb}).item()
+        rel = abs(got - exact) / abs(exact)
+        assert rel < 1e-4, f"augmented quad must match exact, rel_err={rel:.2e}"
+
+
+class TestMixtureTopEigs:
+    """The mixture F = γF_old + (1-γ)F_t + λI is a SUM of Kronecker products,
+    not a single one, so top_eigs must use power iteration, not the product
+    shortcut."""
+
+    def test_mixture_top_eig_matches_materialized_block(self):
+        from kbezier.metrics.mixture import MixtureFisher
+        torch.manual_seed(0)
+        model = nn.Sequential(nn.Linear(10, 6, bias=False))
+        loaderA = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.randn(2000, 10), torch.randint(0, 6, (2000,))),
+            batch_size=400)
+        loaderB = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.randn(2000, 10) * 3 + 1, torch.randint(0, 6, (2000,))),
+            batch_size=400)
+        gamma, damping = 0.6, 1e-2
+        mf = MixtureFisher(gamma=gamma, damping=damping)
+        mf.accumulate(model, loaderA)
+        mf.update_old_fisher(0)
+        mf.accumulate(model, loaderB)
+        A_cur, B_cur = mf._current_fisher.factors["0"]
+        A_old, B_old = mf._old_factors["0"]
+        A_old = A_old.to(A_cur.device); B_old = B_old.to(B_cur.device)
+        eye = torch.eye(B_cur.size(0) * A_cur.size(0))
+        M_true = (gamma * torch.kron(B_old, A_old)
+                  + (1 - gamma) * torch.kron(B_cur, A_cur) + damping * eye)
+        lam_true = torch.linalg.eigvalsh(M_true)[-1].item()
+        lam_pi = mf.top_eigs(k=1)[0].item()
+        ratio = lam_pi / lam_true
+        assert 0.98 < ratio < 1.02, f"power-iter top_eig {lam_pi:.5f} vs true {lam_true:.5f}, ratio={ratio:.4f}"

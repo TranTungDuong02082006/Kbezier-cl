@@ -65,6 +65,8 @@ class MixtureFisher(FisherMetric):
 
         # Copy param mapping from current fisher
         self._param_to_layer: Dict[str, str] = {}
+        self._layer_to_weight_name: Dict[str, str] = {}
+        self._layer_to_bias_name: Dict[str, str] = {}
 
     def accumulate(
         self,
@@ -72,13 +74,20 @@ class MixtureFisher(FisherMetric):
         data_loader,
         criterion=None,
         n_samples: Optional[int] = None,
+        empirical: bool = False,
     ) -> None:
         """
         Estimate current-task Fisher and mix with accumulated old Fisher.
         """
         # Estimate current task Fisher
-        self._current_fisher.accumulate(model, data_loader, criterion, n_samples)
+        self._current_fisher.accumulate(
+            model, data_loader, criterion, n_samples, empirical=empirical
+        )
         self._param_to_layer = dict(self._current_fisher._param_to_layer)
+        self._layer_to_weight_name = dict(self._current_fisher._layer_to_weight_name)
+        self._layer_to_bias_name = dict(
+            getattr(self._current_fisher, "_layer_to_bias_name", {})
+        )
 
         # Mix factors
         self._mix_factors()
@@ -180,44 +189,106 @@ class MixtureFisher(FisherMetric):
             self._old_factors[layer_name] = (A_new.detach().cpu(), B_new.detach().cpu())
 
     def inv_mv(self, grad_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """F_mix⁻¹ @ grad via vec-trick on mixed factors."""
+        """F_mix⁻¹ @ grad via vec-trick on (pre-mixed, factored) mixed factors.
+
+        NOTE: inverting the TRUE mixture γ(A_old⊗B_old)+(1-γ)(A_cur⊗B_cur)+λI is
+        intractable (sum of Kroneckers), so we use the standard K-FAC
+        approximation of pre-mixing factors A_mix, B_mix and inverting that single
+        Kronecker block. Bias is handled jointly as the augmented matrix [∇W|∇b]
+        (see KFACFisher.inv_mv)."""
         result = {}
+        processed_biases: set = set()
+
         for param_name, grad in grad_dict.items():
             layer_name = self._param_to_layer.get(param_name)
             if layer_name is None or layer_name not in self._inv_cache:
                 result[param_name] = grad
                 continue
 
-            A_inv, B_inv = self._inv_cache[layer_name]
+            if "bias" in param_name and param_name in processed_biases:
+                continue
+            if "bias" in param_name and "weight" not in param_name:
+                weight_name = self._layer_to_weight_name.get(layer_name)
+                if weight_name is not None and weight_name in grad_dict:
+                    continue
+                A_inv, B_inv = self._inv_cache[layer_name]
+                a_dim = A_inv.size(0)
+                W_aug = torch.zeros(grad.size(0), a_dim, device=grad.device,
+                                    dtype=grad.dtype)
+                W_aug[:, -1] = grad
+                nat = B_inv @ W_aug @ A_inv
+                result[param_name] = nat[:, -1].contiguous()
+                continue
 
             if "weight" in param_name:
+                A_inv, B_inv = self._inv_cache[layer_name]
                 grad_mat = grad.reshape(grad.size(0), -1)
                 d_out, d_in_flat = grad_mat.shape
                 a_dim = A_inv.size(0)
-                A_inv_w = A_inv[:d_in_flat, :d_in_flat] if a_dim > d_in_flat else A_inv
 
-                nat_grad_mat = B_inv @ grad_mat @ A_inv_w
-                result[param_name] = nat_grad_mat.reshape_as(grad)
-            elif "bias" in param_name:
-                result[param_name] = (B_inv @ grad.unsqueeze(-1)).squeeze(-1)
+                bias_name = self._layer_to_bias_name.get(layer_name)
+                has_bias_absorbed = (a_dim == d_in_flat + 1)
+
+                if bias_name is not None and bias_name in grad_dict and has_bias_absorbed:
+                    b_grad = grad_dict[bias_name].reshape(d_out, 1)
+                    W_aug = torch.cat([grad_mat, b_grad], dim=1)
+                    nat_aug = B_inv @ W_aug @ A_inv
+                    result[param_name] = nat_aug[:, :d_in_flat].reshape_as(grad)
+                    result[bias_name] = nat_aug[:, d_in_flat:].reshape(-1)
+                    processed_biases.add(bias_name)
+                else:
+                    A_inv_w = A_inv[:d_in_flat, :d_in_flat] if a_dim > d_in_flat else A_inv
+                    nat_grad_mat = B_inv @ grad_mat @ A_inv_w
+                    result[param_name] = nat_grad_mat.reshape_as(grad)
 
         return result
 
     def quad(self, vec_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """vᵀ F_mix v using mixed factors."""
+        """vᵀ F_mix v using (pre-mixed) factors, with augmented bias handling."""
         total = torch.tensor(0.0)
+        processed_biases: set = set()
+
         for param_name, vec in vec_dict.items():
             layer_name = self._param_to_layer.get(param_name)
             if layer_name is None or layer_name not in self._mixed_factors:
                 continue
-            if "bias" in param_name:
+
+            if "bias" in param_name and param_name in processed_biases:
+                continue
+            if "bias" in param_name and "weight" not in param_name:
+                weight_name = self._layer_to_weight_name.get(layer_name)
+                if weight_name is not None and weight_name in vec_dict:
+                    continue
+                A, B = self._mixed_factors[layer_name]
+                a_dim = A.size(0)
+                delta = torch.zeros(vec.size(0), a_dim, device=vec.device, dtype=vec.dtype)
+                delta[:, -1] = vec
+                BΔ = B @ delta
+                ΔᵀBΔ = delta.t() @ BΔ
+                val = (ΔᵀBΔ * A).sum()
+                if total.device != val.device:
+                    total = total.to(val.device)
+                total = total + val
+                continue
+
+            if "weight" not in param_name:
                 continue
 
             A, B = self._mixed_factors[layer_name]
             delta = vec.reshape(vec.size(0), -1)
-            d_in_flat = delta.size(1)
+            d_out, d_in_flat = delta.shape
             a_dim = A.size(0)
-            A_w = A[:d_in_flat, :d_in_flat] if a_dim > d_in_flat else A
+
+            bias_name = self._layer_to_bias_name.get(layer_name)
+            has_bias_absorbed = (a_dim == d_in_flat + 1)
+
+            if bias_name is not None and bias_name in vec_dict and has_bias_absorbed:
+                b_vec = vec_dict[bias_name].reshape(d_out, 1)
+                delta = torch.cat([delta, b_vec], dim=1)
+                A_w = A
+                processed_biases.add(bias_name)
+            else:
+                A_w = A[:d_in_flat, :d_in_flat] if a_dim > d_in_flat else A
 
             BΔ = B @ delta
             ΔᵀBΔ = delta.t() @ BΔ
@@ -229,13 +300,66 @@ class MixtureFisher(FisherMetric):
 
         return total
 
+    @staticmethod
+    def _kron_matvec(A: torch.Tensor, B: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+        """(A⊗B) vec_row(X) = vec_row(B X Aᵀ), X shape (d_out, d_in)."""
+        return B @ X @ A.t()
+
+    def _mixture_block_matvec(self, layer_name: str):
+        """Matvec of the TRUE damped mixture block of one layer:
+
+            M = γ (A_old ⊗ B_old) + (1-γ) (A_cur ⊗ B_cur) + λI
+
+        a SUM of Kronecker products plus identity — NOT a single Kronecker
+        product, so λ_max(M) ≠ λ_max(A_mix)·λ_max(B_mix). We expose only the
+        matvec and let power iteration find λ_max(M)."""
+        A_cur, B_cur = self._current_fisher.factors[layer_name]
+        device = A_cur.device
+        has_old = layer_name in self._old_factors
+        if has_old:
+            A_old, B_old = self._old_factors[layer_name]
+            A_old = A_old.to(device)
+            B_old = B_old.to(device)
+            if A_old.shape != A_cur.shape or B_old.shape != B_cur.shape:
+                has_old = False
+
+        lam = self.damping
+        g = self.gamma
+
+        def matvec(X: torch.Tensor) -> torch.Tensor:
+            out = lam * X
+            out = out + (1.0 - g) * self._kron_matvec(A_cur, B_cur, X)
+            if has_old:
+                out = out + g * self._kron_matvec(A_old, B_old, X)
+            else:
+                out = out + g * self._kron_matvec(A_cur, B_cur, X)
+            return out
+
+        return matvec, B_cur.size(0), A_cur.size(0), device
+
+    @staticmethod
+    def _power_iter_top_eig(d_out, d_in, device, matvec, n_iter=50, tol=1e-6):
+        v = torch.randn(d_out, d_in, device=device)
+        v = v / v.norm().clamp(min=1e-12)
+        eig = torch.tensor(0.0, device=device)
+        for _ in range(n_iter):
+            w = matvec(v)
+            new_eig = (v * w).sum()
+            v = w / w.norm().clamp(min=1e-12)
+            if (new_eig - eig).abs() <= tol * new_eig.abs().clamp(min=1e-12):
+                eig = new_eig
+                break
+            eig = new_eig
+        return eig.clamp(min=0)
+
     def top_eigs(self, k: int = 1) -> torch.Tensor:
-        """Top eigenvalues of mixed Fisher."""
+        """Top-k eigenvalues of the TRUE mixture Fisher, per layer, via power
+        iteration on each layer's mixture block matvec. The product shortcut
+        λ_max(A)·λ_max(B) is INVALID here (sum of Kronecker products)."""
         all_eigs = []
-        for name, (A, B) in self._mixed_factors.items():
-            eigs_A = torch.linalg.eigvalsh(A)
-            eigs_B = torch.linalg.eigvalsh(B)
-            all_eigs.append(eigs_A[-1].clamp(min=0) * eigs_B[-1].clamp(min=0))
+        for layer_name in self._current_fisher.factors:
+            matvec, d_out, d_in, device = self._mixture_block_matvec(layer_name)
+            all_eigs.append(self._power_iter_top_eig(d_out, d_in, device, matvec))
 
         if not all_eigs:
             return torch.zeros(k)
@@ -244,10 +368,10 @@ class MixtureFisher(FisherMetric):
         return torch.topk(all_eigs, k).values
 
     def get_old_fisher_top_eig(self) -> torch.Tensor:
-        """
-        Get λ_max(F_old) — needed for Proposition 2 bound:
-        ρ²/λ ≤ 2τ/λ_max(F_old)
-        """
+        """λ_max(F_old) for the Proposition 2 bound ρ²/λ ≤ 2τ/λ_max(F_old).
+
+        F_old per layer IS a single Kronecker product A_old⊗B_old (accumulated,
+        undamped), so the product-of-tops identity is exact here."""
         all_eigs = []
         for name, (A, B) in self._old_factors.items():
             eigs_A = torch.linalg.eigvalsh(A)

@@ -48,6 +48,7 @@ class KFACFisher(FisherMetric):
         # Mapping from model param names → layer names (for grad_dict lookup)
         self._param_to_layer: Dict[str, str] = {}
         self._layer_to_weight_name: Dict[str, str] = {}
+        self._layer_to_bias_name: Dict[str, str] = {}
 
     def accumulate(
         self,
@@ -55,18 +56,40 @@ class KFACFisher(FisherMetric):
         data_loader,
         criterion=None,
         n_samples: Optional[int] = None,
+        empirical: bool = False,
     ) -> None:
         """
         Estimate K-FAC factors using hooks.
 
+        Two correctness points (vs. a naive implementation):
+
+        1. TRUE Fisher vs EMPIRICAL Fisher. The Fisher Information Matrix is an
+           expectation over labels drawn from the MODEL's predictive
+           distribution p_w(y|x), NOT the dataset's true labels. We therefore
+           sample y ~ softmax(logits) by default. Set empirical=True to use
+           dataset labels (empirical Fisher), a cruder approximation.
+
+        2. PER-SAMPLE output gradients. K-FAC's B factor is E[g gᵀ] where g is
+           the gradient of the PER-SAMPLE loss w.r.t. the layer pre-activation.
+           With mean reduction the captured grad_output is divided by the batch
+           size, which collapses the scale of B (trace(B) ~ 1/N² of trace(A))
+           and breaks the Martens–Grosse damping balance, making F⁻¹g point in
+           nearly a random direction. We use reduction='sum' so each captured g
+           is a true per-sample gradient; finalize() then divides by the sample
+           count to form the correct expectation.
+
         Args:
             model: Network to compute Fisher for.
             data_loader: DataLoader for Fisher estimation.
-            criterion: Loss function. Default: CrossEntropyLoss.
+            criterion: IGNORED (we always use summed cross-entropy internally to
+                       obtain per-sample gradients); kept for API compatibility.
             n_samples: Max samples to use. None = full dataset.
+            empirical: If True, use dataset labels (empirical Fisher) instead of
+                       model-sampled labels (true Fisher).
         """
-        if criterion is None:
-            criterion = nn.CrossEntropyLoss()
+        # Always use summed cross-entropy so grad_output is the per-sample
+        # gradient (not divided by batch size). See docstring point 2.
+        sum_ce = nn.CrossEntropyLoss(reduction="sum")
 
         # Build param name mapping
         self._build_param_mapping(model)
@@ -86,7 +109,16 @@ class KFACFisher(FisherMetric):
 
                 model.zero_grad()
                 output = model(x)
-                loss = criterion(output, y)
+
+                if empirical:
+                    target = y
+                else:
+                    # True Fisher: sample labels from the model distribution.
+                    with torch.no_grad():
+                        probs = torch.softmax(output, dim=1)
+                        target = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+                loss = sum_ce(output, target)
                 loss.backward()
 
                 hook_manager.accumulate_step()
@@ -106,6 +138,7 @@ class KFACFisher(FisherMetric):
         """Map parameter names to layer names for grad_dict lookup."""
         self._param_to_layer.clear()
         self._layer_to_weight_name.clear()
+        self._layer_to_bias_name.clear()
 
         for layer_name, module in model.named_modules():
             if isinstance(module, (nn.Linear, nn.Conv2d)):
@@ -115,6 +148,7 @@ class KFACFisher(FisherMetric):
                 if module.bias is not None:
                     bias_name = f"{layer_name}.bias"
                     self._param_to_layer[bias_name] = layer_name
+                    self._layer_to_bias_name[layer_name] = bias_name
 
     def _apply_factored_damping(
         self, A: torch.Tensor, B: torch.Tensor
@@ -162,18 +196,21 @@ class KFACFisher(FisherMetric):
         Compute F⁻¹ @ grad via K-FAC vec-trick.
 
         For each layer ℓ:
-            F_ℓ⁻¹ vec(∇W) = vec(B̃⁻¹ ∇W Ã⁻¹)
+            F_ℓ⁻¹ vec(∇W_aug) = vec(B̃⁻¹ ∇W_aug Ã⁻¹)
 
-        This is TWO small matrix multiplications per layer, never
-        materializing the full (d_in·d_out × d_in·d_out) matrix.
+        BIAS HANDLING (correct, augmented form): the hook absorbs bias by
+        appending a 1 to the activation, so Ã is (d_in+1) × (d_in+1) and the
+        layer's true parameter is the AUGMENTED matrix W_aug = [W | b] of shape
+        (d_out, d_in+1) — bias is the last column. The Fisher block is B ⊗ Ã, so
+        the natural gradient is B̃⁻¹ [∇W | ∇b] Ã⁻¹, after which we split the last
+        column back out as the bias. Processing weight and bias separately (the
+        previous approach) drops the weight–bias cross terms in Ã⁻¹ and is wrong.
 
-        Args:
-            grad_dict: {param_name: gradient_tensor}
-
-        Returns:
-            {param_name: F⁻¹ @ gradient_tensor}
+        This is TWO small matrix multiplications per layer, never materializing
+        the full matrix.
         """
         result = {}
+        processed_biases: set = set()
 
         for param_name, grad in grad_dict.items():
             layer_name = self._param_to_layer.get(param_name)
@@ -182,67 +219,109 @@ class KFACFisher(FisherMetric):
                 result[param_name] = grad
                 continue
 
-            A_inv, B_inv = self._inv_cache[layer_name]
+            if "bias" in param_name and param_name in processed_biases:
+                continue
+            if "bias" in param_name and "weight" not in param_name:
+                weight_name = self._layer_to_weight_name.get(layer_name)
+                if weight_name is not None and weight_name in grad_dict:
+                    continue  # handled jointly with its weight below
+                # bias-only fallback: augmented [0 | b], full A_inv
+                A_inv, B_inv = self._inv_cache[layer_name]
+                a_dim = A_inv.size(0)
+                W_aug = torch.zeros(grad.size(0), a_dim, device=grad.device,
+                                    dtype=grad.dtype)
+                W_aug[:, -1] = grad
+                nat = B_inv @ W_aug @ A_inv
+                result[param_name] = nat[:, -1].contiguous()
+                continue
 
             if "weight" in param_name:
-                # grad is (d_out, d_in) for Linear, (C_out, C_in, k, k) for Conv2d
+                A_inv, B_inv = self._inv_cache[layer_name]
                 grad_mat = grad.reshape(grad.size(0), -1)  # (d_out, d_in_flat)
-
-                # If bias was absorbed, A_inv is (d_in+1, d_in+1)
-                # but grad_mat is (d_out, d_in). Trim A_inv.
                 d_out, d_in_flat = grad_mat.shape
                 a_dim = A_inv.size(0)
-                if a_dim > d_in_flat:
-                    # Bias was absorbed: use top-left (d_in, d_in) block
-                    A_inv_w = A_inv[:d_in_flat, :d_in_flat]
+
+                bias_name = self._layer_to_bias_name.get(layer_name)
+                has_bias_absorbed = (a_dim == d_in_flat + 1)
+
+                if bias_name is not None and bias_name in grad_dict and has_bias_absorbed:
+                    # Joint augmented handling: W_aug = [∇W | ∇b]
+                    b_grad = grad_dict[bias_name].reshape(d_out, 1)
+                    W_aug = torch.cat([grad_mat, b_grad], dim=1)  # (d_out, d_in+1)
+                    nat_aug = B_inv @ W_aug @ A_inv                # (d_out, d_in+1)
+                    result[param_name] = nat_aug[:, :d_in_flat].reshape_as(grad)
+                    result[bias_name] = nat_aug[:, d_in_flat:].reshape(-1)
+                    processed_biases.add(bias_name)
                 else:
-                    A_inv_w = A_inv
-
-                # Vec-trick: F⁻¹ vec(∇W) = vec(B̃⁻¹ ∇W Ã⁻¹)
-                nat_grad_mat = B_inv @ grad_mat @ A_inv_w
-                result[param_name] = nat_grad_mat.reshape_as(grad)
-
-            elif "bias" in param_name:
-                # If bias absorbed: natural gradient for bias comes from
-                # the last row/column of the Kronecker product.
-                # Simplified: just scale by B_inv diagonal average
-                result[param_name] = B_inv @ grad.unsqueeze(-1)
-                result[param_name] = result[param_name].squeeze(-1)
+                    # No bias (or no absorption): trim Ã⁻¹ to the weight block.
+                    A_inv_w = A_inv[:d_in_flat, :d_in_flat] if a_dim > d_in_flat else A_inv
+                    nat_grad_mat = B_inv @ grad_mat @ A_inv_w
+                    result[param_name] = nat_grad_mat.reshape_as(grad)
 
         return result
 
     def quad(self, vec_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Compute vᵀ F v = Σ_ℓ tr(Δ_ℓᵀ B_ℓ Δ_ℓ A_ℓ) per layer.
+        Compute vᵀ F v = Σ_ℓ tr(Δ_aug,ℓᵀ B_ℓ Δ_aug,ℓ A_ℓ) per layer.
 
         Uses Kronecker identity: vec(Δ)ᵀ (A⊗B) vec(Δ) = tr(Δᵀ B Δ A).
         No inverse needed — uses raw factors.
+
+        BIAS HANDLING: when bias is absorbed (A is (d_in+1)×(d_in+1)), the
+        displacement/velocity for the layer is the augmented matrix
+        Δ_aug = [ΔW | Δb] and the quadratic uses the FULL A. Dropping bias (the
+        previous approach) both ignored the bias energy and mismatched A's
+        (d_in+1) dimension.
         """
         total = torch.tensor(0.0)
+        processed_biases: set = set()
 
         for param_name, vec in vec_dict.items():
             layer_name = self._param_to_layer.get(param_name)
             if layer_name is None or layer_name not in self.factors:
                 continue
-            if "bias" in param_name:
-                continue  # Handle bias separately if needed
+
+            if "bias" in param_name and param_name in processed_biases:
+                continue
+            if "bias" in param_name and "weight" not in param_name:
+                weight_name = self._layer_to_weight_name.get(layer_name)
+                if weight_name is not None and weight_name in vec_dict:
+                    continue  # handled jointly with the weight
+                A, B = self.factors[layer_name]
+                a_dim = A.size(0)
+                delta = torch.zeros(vec.size(0), a_dim, device=vec.device, dtype=vec.dtype)
+                delta[:, -1] = vec
+                BΔ = B @ delta
+                ΔᵀBΔ = delta.t() @ BΔ
+                val = (ΔᵀBΔ * A).sum()
+                if total.device != val.device:
+                    total = total.to(val.device)
+                total = total + val
+                continue
+
+            if "weight" not in param_name:
+                continue
 
             A, B = self.factors[layer_name]
-
-            # Reshape to matrix (d_out, d_in)
-            delta = vec.reshape(vec.size(0), -1)
+            delta = vec.reshape(vec.size(0), -1)  # (d_out, d_in_flat)
             d_out, d_in_flat = delta.shape
             a_dim = A.size(0)
-            if a_dim > d_in_flat:
-                A_w = A[:d_in_flat, :d_in_flat]
-            else:
-                A_w = A
 
-            # tr(Δᵀ B Δ A) = tr(A Δᵀ B Δ)
-            # Efficient: (B @ Δ) then element-wise multiply with Δ, sum, then trace with A
-            BΔ = B @ delta                    # (d_out, d_in)
-            ΔᵀBΔ = delta.t() @ BΔ           # (d_in, d_in)
-            val = (ΔᵀBΔ * A_w).sum()         # tr(Δᵀ B Δ A)
+            bias_name = self._layer_to_bias_name.get(layer_name)
+            has_bias_absorbed = (a_dim == d_in_flat + 1)
+
+            if bias_name is not None and bias_name in vec_dict and has_bias_absorbed:
+                b_vec = vec_dict[bias_name].reshape(d_out, 1)
+                delta = torch.cat([delta, b_vec], dim=1)  # (d_out, d_in+1)
+                A_w = A
+                processed_biases.add(bias_name)
+            else:
+                A_w = A[:d_in_flat, :d_in_flat] if a_dim > d_in_flat else A
+
+            # tr(Δᵀ B Δ A)
+            BΔ = B @ delta
+            ΔᵀBΔ = delta.t() @ BΔ
+            val = (ΔᵀBΔ * A_w).sum()
 
             if total.device != val.device:
                 total = total.to(val.device)
@@ -252,20 +331,22 @@ class KFACFisher(FisherMetric):
 
     def top_eigs(self, k: int = 1) -> torch.Tensor:
         """
-        Compute top-k eigenvalues of F.
+        Compute top-k eigenvalues of the damped Fisher F + λI (per-layer max).
 
-        Uses: λ_max(A⊗B) = λ_max(A) · λ_max(B).
-        Each factor's eigenvalues via torch.linalg.eigvalsh (exact for small matrices).
-        Returns the global top-k across all layers.
+        For a SINGLE Kronecker block the identity λ_max(Ã⊗B̃)=λ_max(Ã)·λ_max(B̃)
+        is exact, so we use it on the DAMPED factors (the same Ã, B̃ that inv_mv
+        inverts). Returns the global top-k across layers.
+
+        NOTE: exactness holds only because each layer's Fisher is a single
+        Kronecker product. MixtureFisher overrides this with power iteration
+        because a sum of Kronecker products is NOT a Kronecker product.
         """
         all_eigs = []
 
         for name, (A, B) in self.factors.items():
-            # Eigenvalues of small factors (cheap — factors are d×d)
-            eigs_A = torch.linalg.eigvalsh(A)  # ascending
-            eigs_B = torch.linalg.eigvalsh(B)
-
-            # Top eigenvalue of Kronecker product = product of tops
+            A_d, B_d = self._apply_factored_damping(A, B)
+            eigs_A = torch.linalg.eigvalsh(A_d)  # ascending
+            eigs_B = torch.linalg.eigvalsh(B_d)
             top_A = eigs_A[-1].clamp(min=0)
             top_B = eigs_B[-1].clamp(min=0)
             all_eigs.append(top_A * top_B)

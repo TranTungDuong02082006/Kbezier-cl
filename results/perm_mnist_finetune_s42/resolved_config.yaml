@@ -1,0 +1,39 @@
+seed: 42
+device: cpu
+num_workers: 4
+pin_memory: true
+log_dir: results
+tensorboard: true
+log_interval: 50
+epochs_per_task: 5
+batch_size: 128
+lr: 0.01
+momentum: 0.9
+weight_decay: 0.0
+fisher:
+  update_freq: 1
+  samples: 1000
+  damping: 0.001
+deterministic: true
+benchmark_cudnn: false
+method:
+  name: finetune
+benchmark:
+  name: perm_mnist
+  dataset: MNIST
+  n_tasks: 10
+  scenario: domain-IL
+  input_size:
+  - 1
+  - 28
+  - 28
+  n_classes: 10
+model:
+  name: mlp
+  hidden_sizes:
+  - 400
+  - 400
+  dropout: 0.0
+_meta:
+  config_hash: 2831a3eb1387
+  git_hash: 8c5e1550c1bae4008547fd3691d6bf1dca55e7ae

@@ -320,3 +320,56 @@ class FSAMStrategy(BaseStrategy):
 
     def after_task(self, task_id, train_loader=None):
         pass
+
+
+# ── Bézier-only strategy (for ablation: connectivity without R-SAM) ──
+
+@Registry.register_strategy("bezier")
+class BezierStrategy(KBezierStrategy):
+    """Bézier path connectivity with a PLAIN optimizer (no R-SAM).
+
+    Isolates the contribution of curved mode connectivity for the ablation
+    grid {SAM, R-SAM} × {linear, Bézier}. Everything (mixture Fisher, path
+    loss, control-point optimization, anchor offload) is identical to
+    KBezierStrategy except the per-batch task step uses the base optimizer
+    directly instead of the Riemannian-SAM perturbation.
+    """
+
+    def observe(self, x: torch.Tensor, y: torch.Tensor, task_id: int) -> float:
+        self.model.train()
+
+        # ── Plain SGD step on current task (NO R-SAM perturbation) ──
+        self.optimizer.zero_grad()
+        loss = self.criterion(self.model(x), y)
+        loss.backward()
+        self.optimizer.step()
+        task_loss = float(loss.item())
+
+        # ── Bézier path-loss on replay data (global connectivity) ──
+        gmc_loss = 0.0
+        if (
+            self.path_loss_fn is not None
+            and self.cp_optimizer is not None
+            and self.replay_buffer.n_tasks > 0
+        ):
+            x_replay, y_replay = self.replay_buffer.sample(
+                batch_size=x.size(0),
+                up_to_task=task_id - 1,
+                device=self.device,
+            )
+            current_params = {
+                name: param.detach().clone()
+                for name, param in self.model.named_parameters()
+            }
+            self.bezier_curve.update_endpoint(current_params)
+
+            self.cp_optimizer.zero_grad()
+            path_loss, info = self.path_loss_fn(x_replay, y_replay)
+            scaled_path_loss = self.alpha * path_loss
+            scaled_path_loss.backward()
+            self.cp_optimizer.step()
+
+            gmc_loss = info["total_gmc_loss"]
+
+        self.replay_buffer.update(task_id, x, y)
+        return task_loss + gmc_loss

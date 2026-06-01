@@ -82,10 +82,13 @@ def main():
         first_classes = task_datasets[0].get("classes", [])
         model_kwargs["initial_classes"] = len(first_classes)
 
-    if callable(model_cls):
-        model = model_cls(**model_kwargs)
-    else:
-        model = model_cls(**model_kwargs)
+    import inspect
+    sig = inspect.signature(model_cls)
+    has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if not has_var_keyword:
+        model_kwargs = {k: v for k, v in model_kwargs.items() if k in sig.parameters}
+
+    model = model_cls(**model_kwargs)
 
     # Expand head for all tasks if class-IL
     scenario = get_nested(config, "benchmark.scenario", "task-IL")

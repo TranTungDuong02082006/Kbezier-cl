@@ -100,6 +100,11 @@ def main():
             model_kwargs = dict(run_config.get("model", {}))
             model_kwargs.pop("name", None)
             model_kwargs["initial_classes"] = len(task_datasets[0].get("classes", []))
+            import inspect
+            sig = inspect.signature(model_cls)
+            has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not has_var_keyword:
+                model_kwargs = {k: v for k, v in model_kwargs.items() if k in sig.parameters}
             model = model_cls(**model_kwargs)
 
             scenario = gn(run_config, "benchmark.scenario", "task-IL")
